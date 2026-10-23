@@ -20,6 +20,7 @@ Analysis of issues in [earendil-works/pi](https://github.com/earendil-works/pi) 
 ### 1. #11254 - Import toCodemodeIdentifier from pi-codemode/declarations
 **URL:** https://github.com/earendil-works/pi/issues/11254  
 **Labels:** durable  
+**Status:** ⏸️ Deferred (暂时先不做)  
 **Complexity:** One-line import change
 
 Change the import source of `toCodemodeIdentifier` from `@earendil-works/pi-codemode/portable` to `@earendil-works/pi-codemode/declarations` in `packages/durable/src/codemode/codemode.ts`. The `/portable` module re-exports `InlineCodemodeSandbox`, causing the WASM runtime to load unnecessarily. Author offers to send the PR.
@@ -31,6 +32,7 @@ Change the import source of `toCodemodeIdentifier` from `@earendil-works/pi-code
 ### 2. #11180 - Environments CI fails: @earendil-works/pi-telemetry has no source export condition
 **URL:** https://github.com/earendil-works/pi/issues/11180  
 **Labels:** prio:p0  
+**Status:** ⏸️ Deferred (暂时先不做)  
 **Complexity:** Package.json configuration fix
 
 CI fails because `packages/telemetry/package.json` declares `"source"` export only on `./render`, not on `.` or `./testing`. The vitest config resolves with `conditions: ["source"]`, causing resolution to fall through to unbuilt `./dist/index.js`.
@@ -42,6 +44,7 @@ CI fails because `packages/telemetry/package.json` declares `"source"` export on
 ### 3. #11055 - Let beforeRequest reject a request
 **URL:** https://github.com/earendil-works/pi/issues/11055  
 **Labels:** (none)  
+**Status:** ⏸️ Deferred (暂时先不做)  
 **Complexity:** Hook extension with existing pattern
 
 `GenerationHooks.beforeRequest` can rewrite messages but cannot stop a request. A throw goes to `onReport` and the request still sends. Need to allow `beforeRequest` to return `{ reject: string }` (or throw `RequestRejected`) to settle the run with a terminal error without retrying.
@@ -53,6 +56,7 @@ CI fails because `packages/telemetry/package.json` declares `"source"` export on
 ### 4. #10804 - Support Anthropic thinking.display "updates"
 **URL:** https://github.com/earendil-works/pi/issues/10804  
 **Labels:** durable  
+**Status:** ⏸️ Deferred (暂时先不做)  
 **Complexity:** Type widening + beta header
 
 Add `"updates"` to `AnthropicThinkingDisplay` type, append `thinking-display-updates-2026-08-18` beta when used, and add `thinkingDisplay` option to `ConversationStreamOptions` in pi-durable.
@@ -284,13 +288,11 @@ Umbrella issue covering: (1) idempotent keyed process spawning in pi-env, (2) re
 
 ## Recommendations
 
-**Quick wins to start with:**
-- #11254 (one-line import change)
-- #11180 (CI fix, p0 priority)
-- #11055 (beforeRequest rejection - clear pattern exists)
+**Deferred easy issues (暂时先不做):**
+- #11254, #11180, #11055, #10804
 
-**High-impact medium efforts:**
-- #11055 (beforeRequest rejection - clear pattern exists)
+**Next priorities (Medium difficulty):**
+- #11149 (admit submission in host commit - clear API design needed)
 - #10535 (commit retry delays - improves serverless efficiency)
 - #10845 (task identification - enables proper billing)
 
