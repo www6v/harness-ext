@@ -1,0 +1,115 @@
+# =============================================================================
+# DeepSeek Harness - Docker Compose Configuration
+# =============================================================================
+# Usage:
+#   docker compose up -d          # Start in detached mode
+#   docker compose down           # Stop and remove containers
+#   docker compose logs -f        # Follow logs
+#   docker compose exec dsh bash  # Execute shell in container
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # DeepSeek Harness CLI Service
+  # ---------------------------------------------------------------------------
+  dsh:
+    build:
+      context: ../../deepseek-harness
+      dockerfile: ../deepseek-harness-ext/deploy/Dockerfile.optimized
+    container_name: deepseek-harness
+    restart: unless-stopped
+
+    # Override CMD to add --trusted-host for the public IP that maps to this
+    # container. The /api trust fence checks the Host header against loopback +
+    # trustedHosts; Docker's internal LAN IPs don't include the public IP, so
+    # we declare it explicitly. Without this, browser API calls get HTTP 403.
+    command: ["node", "apps/cli/lib/bin.js", "web", "--host", "0.0.0.0", "--port", "3080", "--no-open", "--trusted-host", "124.221.28.203"]
+
+    # Port mapping - web UI accessible from host
+    ports:
+      - "${DSH_WEB_PORT:-3080}:3080"
+
+    # Environment variables
+    environment:
+      - NODE_ENV=production
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-}
+      - DSH_HOME=/app/.dsh
+      - DSH_ALLOW_WILDCARD_HOST=1
+      - TZ=${TZ:-UTC}
+
+    # Volume mounts for persistent data
+    volumes:
+      # Configuration directory
+      - dsh-config:/app/.dsh/config
+
+      # Session data
+      - dsh-sessions:/app/.dsh/sessions
+
+      # Logs
+      - dsh-logs:/app/.dsh/logs
+
+      # Optional: Mount local project for agent work
+      # - ./workspace:/workspace
+
+    # Network configuration
+    networks:
+      - dsh-network
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+    # Health check: verify the web server is listening.
+    # Use -so (no -f) because the root URL returns 303 redirect for auth,
+    # which is a valid response indicating the service is up.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -so /dev/null http://127.0.0.1:3080/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+
+    # Read-only root filesystem (with writable volumes)
+    read_only: false
+
+  # =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  dsh-config:
+    driver: local
+    name: deepseek-harness-config
+
+  dsh-sessions:
+    driver: local
+    name: deepseek-harness-sessions
+
+  dsh-logs:
+    driver: local
+    name: deepseek-harness-logs
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  dsh-network:
+    driver: bridge
+    name: deepseek-harness-network

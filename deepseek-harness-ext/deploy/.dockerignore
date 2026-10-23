@@ -1,0 +1,64 @@
+# Docker build context ignore file
+
+# Git
+.git
+.gitignore
+
+# Node modules (we install inside container)
+node_modules
+
+# Build outputs
+dist
+lib
+*.tsbuildinfo
+.dsh-build
+
+# Documentation
+*.md
+docs/
+
+# Tests
+tests/
+__tests__/
+*.spec.ts
+*.test.ts
+
+# Dev config
+.idea
+.vscode
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large files
+*.zip
+*.tar
+*.tar.gz
+
+# Snapshots
+snapshots/
+fixtures/
+
+# Benchmarks
+benchmarks/
+
+# Website
+website/
+
+# Agent notes
+.agents/notes/
+
+# Python
+__pycache__
+*.pyc
+.venv
+
+# Do not ignore patches folder - needed for pnpm
+# patches/

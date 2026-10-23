@@ -1,0 +1,73 @@
+# =============================================================================
+# DeepSeek Harness - Development Docker Compose Override
+# =============================================================================
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# =============================================================================
+
+version: '3.8'
+
+services:
+  dsh:
+    # Override build context for development
+    build:
+      context: ../../deepseek-harness
+      dockerfile: ../deepseek-harness-ext/deploy/Dockerfile
+      target: builder  # Use builder stage for development
+
+    # Mount source code for hot reload
+    volumes:
+      - ../../deepseek-harness/apps:/app/apps
+      - ../../deepseek-harness/packages:/app/packages
+      - ../../deepseek-harness/vendor:/app/vendor
+      - ../../deepseek-harness/native:/app/native
+      - ../../deepseek-harness/scripts:/app/scripts
+      - ../../deepseek-harness/tsconfig*.json:/app/
+      - dsh-config:/app/.dsh/config
+      - dsh-sessions:/app/.dsh/sessions
+      - dsh-logs:/app/.dsh/logs
+
+    # Development environment
+    environment:
+      - NODE_ENV=development
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-}
+      - DEBUG=${DEBUG:-}
+      - DSH_HOME=/app/.dsh
+
+    # Keep container running
+    stdin_open: true
+    tty: true
+
+    # Override command for development
+    command: ["node", "--import", "tsx/esm", "apps/cli/src/bin.ts", "--help"]
+
+  dsh-web:
+    # Development build
+    build:
+      context: ../../deepseek-harness
+      dockerfile: ../deepseek-harness-ext/deploy/Dockerfile
+      target: builder
+
+    # Mount source code
+    volumes:
+      - ../../deepseek-harness/apps:/app/apps
+      - ../../deepseek-harness/packages:/app/packages
+      - ../../deepseek-harness/vendor:/app/vendor
+      - ../../deepseek-harness/native:/app/native
+      - ../../deepseek-harness/scripts:/app/scripts
+      - dsh-config:/app/.dsh/config
+      - dsh-sessions:/app/.dsh/sessions
+      - dsh-logs:/app/.dsh/logs
+
+    # Development environment
+    environment:
+      - NODE_ENV=development
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-}
+      - DEBUG=${DEBUG:-}
+      - DSH_HOME=/app/.dsh
+      - DSH_WEB_PORT=3000
+
+    # Dev server command with watch mode
+    command: ["node", "--import", "tsx/esm", "apps/cli/src/bin.ts", "web", "--port", "3000", "--watch"]

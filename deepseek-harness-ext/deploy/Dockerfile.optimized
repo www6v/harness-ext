@@ -1,0 +1,111 @@
+# =============================================================================
+# DeepSeek Harness - Dockerfile for Production
+# Based on validated deepseek-harness-old/deploy/Dockerfile.dsh
+# =============================================================================
+
+# syntax=docker/dockerfile:1
+
+# ----------------------------------------------------------------------------
+# Stage 1: Install - resolve all pnpm workspace dependencies
+# ----------------------------------------------------------------------------
+FROM node:22-bookworm-slim AS install
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG APT_MIRROR=mirrors.aliyun.com
+
+# Replace Debian mirrors with China mirror for faster downloads
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
+      /etc/apt/sources.list.d/debian.sources \
+  && corepack enable && corepack prepare pnpm@11.7.0 --activate \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends build-essential python3 \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Copy manifests first for layer caching
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY patches/ ./patches/
+
+RUN pnpm config set registry "${NPM_REGISTRY}" \
+  && pnpm install --registry "${NPM_REGISTRY}" --frozen-lockfile --ignore-scripts
+
+# ----------------------------------------------------------------------------
+# Stage 2: Build - TypeScript compile + Vite web bundle
+# ----------------------------------------------------------------------------
+FROM install AS build
+
+COPY . .
+
+# Build TypeScript host packages, client packages, then web frontend
+RUN pnpm run build:lib:host \
+  && pnpm run build:lib:client \
+  && pnpm run build:web \
+  && pnpm run build:native-system
+
+# ----------------------------------------------------------------------------
+# Stage 2b: Runtime-prep - run postinstall scripts so node_modules
+# is complete (native binaries, etc.) before runtime.
+# This avoids pnpm re-running install at container startup.
+# ----------------------------------------------------------------------------
+FROM build AS runtime-prep
+
+# Create .npmrc inline (source tree may not have one)
+RUN printf 'registry=https://registry.npmmirror.com\n' > .npmrc
+
+# Run install WITH scripts (no --ignore-scripts). Dependencies are
+# already downloaded, so this only executes postinstall scripts and
+# finishes quickly (~10s instead of 5 min).
+RUN pnpm install --frozen-lockfile
+
+# ----------------------------------------------------------------------------
+# Stage 3: Runtime - minimal Node with compiled monorepo
+# ----------------------------------------------------------------------------
+FROM node:22-bookworm-slim AS runtime
+
+ARG APT_MIRROR=mirrors.aliyun.com
+
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
+      /etc/apt/sources.list.d/debian.sources \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/* \
+  && corepack enable && corepack prepare pnpm@11.7.0 --activate
+
+WORKDIR /app
+
+# Copy built monorepo: manifests + compiled JS + node_modules + web dist
+COPY --from=runtime-prep /src/package.json /src/pnpm-workspace.yaml /src/pnpm-lock.yaml /src/.npmrc ./
+COPY --from=runtime-prep /src/patches/ ./patches/
+COPY --from=runtime-prep /src/node_modules/ ./node_modules/
+
+# Copy all package directories (source + compiled lib/)
+COPY --from=build /src/apps/ ./apps/
+COPY --from=build /src/packages/ ./packages/
+COPY --from=build /src/vendor/ ./vendor/
+COPY --from=build /src/native/ ./native/
+COPY --from=build /src/scripts/ ./scripts/
+
+# dsh web binds to 0.0.0.0:3080 for Docker networking.
+# DSH_ALLOW_WILDCARD_HOST=1 bypasses the CLI safety check for --host 0.0.0.0
+# in trusted container environments.
+# DSH_HOME defaults to /app/.dsh for container session persistence.
+ENV NODE_ENV=production \
+    DSH_WEB_PORT=3080 \
+    DSH_ALLOW_WILDCARD_HOST=1 \
+    DSH_HOME=/app/.dsh
+
+EXPOSE 3080
+
+# Health check: verify the web server is listening.
+# Use -so (no -f) because the root URL returns 303 redirect for auth,
+# which is a valid response indicating the service is up.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=6 \
+  CMD curl -so /dev/null http://127.0.0.1:3080/ || exit 1
+
+# --trusted-host: allow the /api trust fence to accept browser requests
+# from the public IP that maps to this container (DNS rebinding defense bypass).
+CMD ["node", "apps/cli/lib/bin.js", "web", "--host", "0.0.0.0", "--port", "3080", "--no-open", "--trusted-host", "111.229.26.170"]
+
+LABEL org.opencontainers.image.title="DeepSeek Harness"
+LABEL org.opencontainers.image.description="DeepSeek Harness - AI Agent Harness"
+LABEL org.opencontainers.image.vendor="DeepSeek AI"
