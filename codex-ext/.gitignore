@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Codex runtime data
+.codex-poc-home/
+
+# Archived temp scripts (build debugging history)
+_archive/
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,9 @@
+# Secrets
+.env
+
+# Generated codex home directory
+.codex-poc-home/
+
+# Python cache
+__pycache__/
+*.pyc

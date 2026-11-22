@@ -1,0 +1,14 @@
+# Codex PoC configuration for DashScope/Qwen
+# Placed at /home/codex/.codex/config.toml inside container
+
+model = "qwen3.7-plus"
+model_provider = "dashscope"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+
+[model_providers.dashscope]
+name = "DashScope (Qwen)"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+env_key = "DASHSCOPE_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false

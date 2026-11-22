@@ -1,0 +1,50 @@
+# Docker Compose for Codex PoC remote deployment
+#
+# Architecture:
+#   codex-server: codex app-server listening on WebSocket (internal port 8765)
+#   nginx: reverse proxy for TLS termination (optional, for production)
+#
+# Deploy:
+#   docker compose up -d
+#   docker compose logs -f codex-server
+
+version: "3.9"
+
+services:
+  codex-server:
+    build:
+      context: /data/disk/codex-build
+      dockerfile: /home/wei/meta-harness/codex-ext/deploy/Dockerfile
+    image: codex-server:latest
+    container_name: codex-poc-server
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-sk-e4586ec037624d6792b1c7a4a850cef2}
+      - CODEX_HOME=/home/codex/.codex
+    volumes:
+      - codex-home:/home/codex/.codex
+    command:
+      - "app-server"
+      - "--listen"
+      - "ws://0.0.0.0:8765"
+      - "--ws-auth"
+      - "capability-token"
+      - "--ws-token-file"
+      - "/home/codex/.codex/ws-token"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - codex-net
+
+volumes:
+  codex-home:
+
+networks:
+  codex-net:
+    driver: bridge
