@@ -2,27 +2,83 @@
 
 > **分析对象**: `codex/codex-rs`（Rust 工作空间，v0.155.x 分支快照）
 > **分析目标**: 拆解 Codex 作为"长时间运行的本地 AI 编码代理"，如何在**网络不稳定、模型上下文有限、命令执行有副作用、进程可能崩溃、远端会话可能断连**这五类现实故障下保持可用与可恢复。
-> **配套文档**: `codex-rust-v0.155.1-analysis.md`（整体架构）、`app-server-architecture.md`（app-server）
+> **配套文档**: `../codex-rust-v0.155.1-analysis.md`（整体架构）、`../app-server-architecture.md`（app-server）、`../app-server-api-reference.md`（API 参考）
+>
+> **阅读标记说明**
+> - 目录中每章后的 ⭐ 数量 = 该章重要度（⭐⭐⭐ 核心必读 / ⭐⭐ 重要 / ⭐ 参考速查）
+> - 章节标题下的 `> **重要度**：…` = 该节定位与一句话看点
+> - 正文中的 `> ⭐ **重点**：…` 引用框 = 最关键、最值得移植的结论（全文 13 处）
+> - 表格/清单中的 ⭐ 标记 = 该条目为同类中最关键项
+> - **最短阅读路径**见目录末尾
+
+---
+
+## 重点导读（TL;DR）
+
+### 十大关键机制（按重要性排序）
+
+| # | 关键机制 | 一句话价值 | 代码锚点 | 详见 |
+|---|----------|-----------|----------|------|
+| 1 ⭐⭐⭐ | **失败语义集中化**：`CodexErr::retry_policy()` 把所有错误穷尽归类为 `Never / ServerDirected / Backoff / FallBackToHttp` | 消除散落的 `match status`，新增错误必须显式表态（编译期穷尽保证） | `protocol/src/error.rs:492` | §3.2 |
+| 2 ⭐⭐⭐ | **服务端 deadline 至上**：`RetryAfter(Instant)` 绝对时刻全链路透传，过期归零、不重新计时、换传输也不绕过 | 避免"重试链多次转手后 deadline 被重置"的经典 bug | `http-client/src/retry_after.rs`、`core/src/responses_retry.rs:126` | §3.1、§4.1、§5.1 |
+| 3 ⭐⭐⭐ | **终止性结果不可被重试绕过**：`is_terminal_sampling_outcome`（计费/预算/hook 拒绝/不完整响应） | 重试不会重复计费、不会绕过策略拒绝 | `core/src/responses_retry.rs:33` | §3.3 |
+| 4 ⭐⭐⭐ | **流重试状态机**：双预算（普通 5 次 / 连接失败无限 5s→60s）+ UI 可见 + 耗尽后写入带 `turn_id` 的 `ExhaustedResponseRetry` | 网络整体不可用时无限等待，而不是报错终止；重试建议带身份不跳回合污染 | `core/src/responses_retry.rs`、`core/src/session/turn.rs:2140-2290` | §5.1、§5.2 |
+| 5 ⭐⭐⭐ | **暂停前必须先 flush，flush 失败则不暂停**；暂停**不写终止事件**，因此可用原 `turn_id` 恢复 | 把"丢数据"与"无法恢复"两个风险同时消除 | `core/src/session/turn_suspension.rs` | §8.3 |
+| 6 ⭐⭐⭐ | **写入幂等**：`pending_items` 仅在写成功后移除 + `persist()` 幂等 + fsync（含目录项）+ 跨进程 writer lock | 崩溃/磁盘失败不丢也不重复 | `rollout/src/recorder.rs:1774-1990` | §8.1、§8.4 |
+| 7 ⭐⭐ | **工具证据幂等重放**：`ExecutedToolCallCache`（retry_cache）跨重试存活，冲突时宁可 `invalidate` | 重试不会重跑已执行的副作用（写文件/跑命令） | `core/src/tools/executed_tool_calls{.rs,/request_metadata.rs}`、`session/turn.rs:2167` | §5.4 |
+| 8 ⭐⭐ | **事件序号化幂等重放**：`last_published_seq` + `recover_events()` 去重，恢复窗口 50s 硬上限，在途请求立即失败 | 断连不丢输出、不重复发布、不静默挂死 | `exec-server/src/client_recovery.rs` | §9.1 |
+| 9 ⭐⭐ | **人工介入 fail-closed**：`Default for ReviewDecision = Denied`，超时 = `TimedOut` → 拒绝；但拒绝原因**回给模型**而非终止会话；裁定可固化为策略修正案 | 人不在时安全，人在时能永久减少下一次介入 | `core/src/tools/approvals.rs`、`protocol/src/protocol.rs:4638` | §7.4 |
+| 10 ⭐⭐ | **取消两段式 + 清理有序**：`cancel()` → 100ms 宽限 → `abort()`；先让任务观测取消再 `clear_pending()` | 取消不会把"用户中断"误写成"用户拒绝"而污染历史 | `async-utils/src/lib.rs`、`core/src/tasks/mod.rs:688-800,1225` | §3.4、§5.3、§7.5 |
+
+### 重点图表索引（⭐ 为核心图）
+
+| 图 | 内容 | 位置 |
+|----|------|------|
+| 图 2 ⭐ | 可靠性总体架构（六层 + 错误中枢 + 可观测性） | §2 |
+| 图 3 ⭐ | 错误 → 四种 `RetryPolicy` 分类与延迟计算 | §3.2 |
+| 图 4 ⭐ | 三级错误恢复阶梯（传输自愈→语义自愈→人工介入） | §3.5 |
+| 图 5 ⭐ | 三层重试栈（连接层 / 请求层 / 流层） | §4.1 |
+| 图 6 ⭐ | **流重试状态机**（全文最核心） | §5.1 |
+| 图 7 ⭐ | 取消令牌树与两段式中止 | §5.3 |
+| 图 9 ⭐ | 压缩即检查点（CompactedItem 负载） | §6.1 |
+| 图 11 ⭐ | 人工介入闭环（审批决策全路径，fail-closed） | §7.4 |
+| 图 12 ⭐ | 进程级超时/取消（TERM→KILL、IO 排空） | §7.5 |
+| 图 13/14 ⭐ | Rollout 写入恢复 + 会话恢复路径 | §8.1/§8.2 |
+| 图 15 ⭐ | 暂停/恢复 worker 交接时序（9 步顺序约束） | §8.3 |
+| 图 16 ⭐ | exec-server 断连按序号重放时序 | §9.1 |
+| 图 17 ⭐ | 端到端示例：八机制协同 | §15.1 |
+
+### 四条最值得移植的设计哲学
+
+> ⭐ **① 错误先分类，再决定策略**——重试策略是**错误类型的方法**（`err.retry_delay(n)`），不是调用方的 `if`。
+>
+> ⭐ **② 重试要改变输入**——内容过滤→注入 guidance；上下文溢出→从头裁剪并重置预算；压缩失败→换模型。原样重发只给纯瞬时故障。
+>
+> ⭐ **③ 恢复宁缺勿错（正确性 > 恢复率）**——daemon 中断回合恢复设多重前置条件；恢复期网络策略 fail-closed；协议顺序错乱视为致命。
+>
+> ⭐ **④ 降级必须可见**——WS→HTTP 发 `Warning`、重连发 `Reconnecting... n/m`、提权重试走审批并记 `sandbox_outcome`。用户永远知道系统在自救。
 
 ---
 
 ## 目录
 
-1. [可靠性的五个维度与八个横切关注点](#1-可靠性的五个维度与八个横切关注点)
-2. [总体架构图](#2-总体架构图)
-3. [统一错误模型：可靠性的地基](#3-统一错误模型可靠性的地基)
-4. [传输层可靠性（HTTP / WebSocket / SSE）](#4-传输层可靠性http--websocket--sse)
-5. [回合级流重试：`handle_response_stream_error`](#5-回合级流重试handle_response_stream_error)
-6. [上下文窗口可靠性：压缩、裁剪与模型回退](#6-上下文窗口可靠性压缩裁剪与模型回退)
-7. [执行可靠性：沙箱、审批与"降级重试"](#7-执行可靠性沙箱审批与降级重试)
-8. [状态持久化与崩溃恢复](#8-状态持久化与崩溃恢复)
-9. [远程/分布式会话可靠性（exec-server、remote control、MCP）](#9-远程分布式会话可靠性exec-serverremote-controlmcp)
-10. [认证与配额可靠性](#10-认证与配额可靠性)
-11. [可观测性：让重试可被度量](#11-可观测性让重试可被度量)
-12. [测试策略：可靠性是被测出来的](#12-测试策略可靠性是被测出来的)
-13. [关键常量与默认值速查（含超时/取消/幂等清单）](#13-关键常量与默认值速查)
-14. [设计原则总结与可借鉴点](#14-设计原则总结与可借鉴点)
-15. [八大关注点 × 层级 交叉矩阵](#15-八大关注点--层级-交叉矩阵)
+1. ⭐⭐ [可靠性的五个维度与八个横切关注点](#1-可靠性的五个维度与八个横切关注点)（§1.2 总览矩阵 ⭐⭐⭐）
+2. ⭐⭐ [总体架构图](#2-总体架构图)
+3. ⭐⭐⭐ [统一错误模型：可靠性的地基](#3-统一错误模型可靠性的地基)（§3.2 重试策略分类、§3.3 终止性结果、§3.5 三级恢复阶梯 ⭐⭐⭐）
+4. ⭐⭐ [传输层可靠性（HTTP / WebSocket / SSE）](#4-传输层可靠性http--websocket--sse)（§4.1 三层重试栈、§4.6 重放幂等 ⭐⭐⭐）
+5. ⭐⭐⭐ [回合级流重试：`handle_response_stream_error`](#5-回合级流重试handle_response_stream_error)（全文最核心；§5.3 取消、§5.4 幂等 ⭐⭐⭐）
+6. ⭐⭐ [上下文窗口可靠性：压缩、裁剪与模型回退](#6-上下文窗口可靠性压缩裁剪与模型回退)（§6.1 检查点 ⭐⭐）
+7. ⭐⭐⭐ [执行可靠性：沙箱、审批与"降级重试"](#7-执行可靠性沙箱审批与降级重试)（§7.4 人工介入闭环、§7.5 进程级超时/取消 ⭐⭐⭐）
+8. ⭐⭐⭐ [状态持久化与崩溃恢复](#8-状态持久化与崩溃恢复)（§8.1 写入器、§8.3 暂停/恢复交接协议 ⭐⭐⭐）
+9. ⭐⭐ [远程/分布式会话可靠性（exec-server、remote control、MCP）](#9-远程分布式会话可靠性exec-serverremote-controlmcp)（§9.1 序号重放 ⭐⭐⭐）
+10. ⭐ [认证与配额可靠性](#10-认证与配额可靠性)
+11. ⭐ [可观测性：让重试可被度量](#11-可观测性让重试可被度量)
+12. ⭐ [测试策略：可靠性是被测出来的](#12-测试策略可靠性是被测出来的)
+13. ⭐ [关键常量与默认值速查（含超时/取消/幂等清单）](#13-关键常量与默认值速查)（§13.1 超时全谱 ⭐⭐）
+14. ⭐⭐⭐ [设计原则总结与可借鉴点](#14-设计原则总结与可借鉴点)（§14.1 十四条原则、§14.3 可借鉴清单 ⭐⭐⭐）
+15. ⭐⭐ [八大关注点 × 层级 交叉矩阵](#15-八大关注点--层级-交叉矩阵)（§15.1 端到端例子 ⭐⭐）
+
+> **最短阅读路径**（只看最重要的）：§重点导读 → §3.2/3.3/3.5 → §5.1/5.2 → §8.1/8.3 → §7.4 → §9.1 → §14.1/14.3 → §15.1
 
 > **八个横切关注点**（错误恢复、超时、取消、重试、幂等、检查点、暂停/恢复、人工介入）已分别融入各章：
 > §1.2 总览矩阵 · §3.4-3.5 取消与三级恢复阶梯 · §4.5-4.6 传输超时与重放幂等 · §5.3-5.4 取消令牌树与工具证据幂等 · §6.1 压缩即检查点 · §7.4-7.5 人工介入闭环与进程级超时/取消 · §8.3-8.4 暂停恢复交接协议与幂等写 · §9.4 远端层八关注点 · §10 认证/配额 · §11.1 可观测信号 · §12 分类测试 · §13.1-13.2 常量全谱 · §15 交叉矩阵与端到端例子
@@ -30,7 +86,6 @@
 ---
 
 ## 1. 可靠性的五个维度与八个横切关注点
-
 ### 1.1 五个失败维度
 
 Codex 的"可靠性"不是单点重试，而是一组**分层的失败处理契约**。归纳为五个维度：
@@ -51,18 +106,22 @@ Codex 的"可靠性"不是单点重试，而是一组**分层的失败处理契�
 
 ### 1.2 八个横切关注点
 
+> **重要度**：⭐⭐⭐ 核心｜全文组织线索
+
 上面五个维度是"按故障来源"切分的；而**错误恢复、超时、取消、重试、幂等、检查点、暂停/恢复、人工介入**是八个"按机制"切分的横切关注点。它们在每一层都以成对约束的形式出现——这是本文后续章节的组织线索：
 
 | 关注点 | 一句话契约 | 代表实现 | 详见 |
 |--------|-----------|----------|------|
-| **错误恢复 Error Recovery** | 先分类再恢复；恢复分三级：传输自愈 → 语义自愈（压缩/换模型/提权） → 人工介入 | `CodexErr::retry_policy()`、`handle_unauthorized`、`should_retry_with_current_model`、`client_recovery` | §3.4、§4.4、§6、§7.2、§9.1 |
+| **错误恢复 Error Recovery** ⭐ | 先分类再恢复；恢复分三级：传输自愈 → 语义自愈（压缩/换模型/提权） → 人工介入 | `CodexErr::retry_policy()`、`handle_unauthorized`、`should_retry_with_current_model`、`client_recovery` | §3.4、§4.4、§6、§7.2、§9.1 |
 | **超时 Timeout** | 每一个"等待"都必须有上限；上限来自配置并有硬顶；超时是**结构化结果**而非 panic | 流空闲 5min、WS 建连 15s、exec 10s、用户 shell 1h、恢复窗口 50s、hooks 1~3s、Guardian deadline | §4.5、§7.5、§9.1、§13 |
-| **取消 Cancellation** | `CancellationToken` 树 + `or_cancel` 包裹所有等待；宽限期后强制 `abort()`；取消是**有序清理**不是立刻返回 | `async-utils::OrCancelExt`、`abort_taken_tasks`、`ExecExpiration::Cancellation`、`fail_all_in_flight_work` | §3.4、§5.3、§7.5、§8.3 |
-| **重试 Retry** | 分层预算、指数退避 + 抖动、服务端 deadline 优先、重试要改变输入、耗尽后带身份上抛 | `run_with_retry`、`ResponsesStreamRetryState`、`backoff()`、`ExhaustedResponseRetry` | §4.1、§5、§6、§9.3 |
-| **幂等 Idempotency** | 重试/重放不得产生第二次副作用：请求可重建、序号去重、工具结果缓存复用、审批结果缓存、persist 幂等 | `make_req()`、`last_published_seq`、`ExecutedToolCallCache(retry_cache)`、`ApprovalCacheKey`、`persist()` | §4.6、§5.4、§7.4、§8.1、§9.1 |
+| **取消 Cancellation** ⭐ | `CancellationToken` 树 + `or_cancel` 包裹所有等待；宽限期后强制 `abort()`；取消是**有序清理**不是立刻返回 | `async-utils::OrCancelExt`、`abort_taken_tasks`、`ExecExpiration::Cancellation`、`fail_all_in_flight_work` | §3.4、§5.3、§7.5、§8.3 |
+| **重试 Retry** ⭐ | 分层预算、指数退避 + 抖动、服务端 deadline 优先、重试要改变输入、耗尽后带身份上抛 | `run_with_retry`、`ResponsesStreamRetryState`、`backoff()`、`ExhaustedResponseRetry` | §4.1、§5、§6、§9.3 |
+| **幂等 Idempotency** ⭐ | 重试/重放不得产生第二次副作用：请求可重建、序号去重、工具结果缓存复用、审批结果缓存、persist 幂等 | `make_req()`、`last_published_seq`、`ExecutedToolCallCache(retry_cache)`、`ApprovalCacheKey`、`persist()` | §4.6、§5.4、§7.4、§8.1、§9.1 |
 | **检查点 Checkpoint** | 关键状态在"可证明已落盘"的点固化为可重放快照（压缩项、Guardian 历史、world state、序号、ordinal） | `RolloutItem::Compacted{replacement_history, guardian_history, retained_context}`、`checkpoint_sampling`、`world_state_checkpoint`、`flush()` 屏障 | §6.1、§8.1、§8.3 |
-| **暂停 / 恢复 Pause & Resume** | 暂停前必须 flush（持久化失败则**不**暂停）；暂停不写终止事件，因此可被原 ID 恢复；恢复有严格前置条件 | `Op::SuspendTurnAndShutdown` / `Op::RecoverTurn`、`daemon_recovery::interrupted_turn`、`RolloutRecorder::resume`、exec-server `resume(session_id)` | §8.2、§8.3、§9.1 |
-| **人工介入 Human-in-the-loop** | 机器无法裁定的失败升级为**带 id 的请求**并阻塞等待；决策可缓存/可修政策/可撤销/可超时（超时=拒绝） | `AskForApproval`、`Op::ExecApproval/PatchApproval/ResolveElicitation/UserInputAnswer/RequestPermissionsResponse/ApproveGuardianDeniedAction`、`ReviewDecision::{Denied,Abort,TimedOut}` | §7.4、§9.2、§10 |
+| **暂停 / 恢复 Pause & Resume** ⭐ | 暂停前必须 flush（持久化失败则**不**暂停）；暂停不写终止事件，因此可被原 ID 恢复；恢复有严格前置条件 | `Op::SuspendTurnAndShutdown` / `Op::RecoverTurn`、`daemon_recovery::interrupted_turn`、`RolloutRecorder::resume`、exec-server `resume(session_id)` | §8.2、§8.3、§9.1 |
+| **人工介入 Human-in-the-loop** ⭐ | 机器无法裁定的失败升级为**带 id 的请求**并阻塞等待；决策可缓存/可修政策/可撤销/可超时（超时=拒绝） | `AskForApproval`、`Op::ExecApproval/PatchApproval/ResolveElicitation/UserInputAnswer/RequestPermissionsResponse/ApproveGuardianDeniedAction`、`ReviewDecision::{Denied,Abort,TimedOut}` | §7.4、§9.2、§10 |
+
+**图 1｜1.2 八个横切关注点** ⭐
 
 ```mermaid
 flowchart LR
@@ -94,6 +153,8 @@ flowchart LR
     HI --> L4 & L6
 ```
 
+> ⭐ **重点**：八个关注点**从不单独存在**，总是成对出现（见下）。审阅或设计可靠性时，应逐对检查而不是逐点检查。
+
 **成对约束**是理解 Codex 可靠性的关键，例如：
 
 - 重试 ⟷ 幂等：任何重试路径都必须先回答"重放会不会造成第二次副作用"（§4.6、§5.4）。
@@ -105,6 +166,8 @@ flowchart LR
 ---
 
 ## 2. 总体架构图
+
+**图 2｜2. 总体架构图** ⭐
 
 ```mermaid
 flowchart TB
@@ -192,11 +255,17 @@ flowchart TB
 
 **读图要点**：`protocol/error.rs` 是唯一的"失败语义中枢"，传输层（`codex-client`）、回合层（`responses_retry`）、压缩层（`compact`）、评审层（`guardian-reviewer`）都向它询问"要不要重试、等多久"，而不是各自散落地写 `match status` 判断。这是 Codex 可靠性最重要的结构性决定。
 
+> ⭐ **重点**：可靠性在 Codex 里是**架构属性**而非补丁——失败语义集中在一个类型上，所有层复用同一套策略查询接口。这是本文最值得移植的一条。
+
 ---
 
 ## 3. 统一错误模型：可靠性的地基
 
+> **重要度**：⭐⭐⭐ 核心｜所有可靠性决策的唯一入口
+
 ### 3.1 结构
+
+⭐ **关键代码 1｜错误即策略载体**
 
 ```rust
 // protocol/src/error.rs
@@ -219,6 +288,10 @@ enum RetryPolicy { Never, ServerDirected, Backoff, FallBackToHttp }
 
 ### 3.2 重试策略分类（节选自 `retry_policy()`）
 
+> **重要度**：⭐⭐⭐ 核心｜穷尽 match，无默认分支
+
+**图 3｜3.2 重试策略分类（节选自 `retry_policy()`）** ⭐
+
 ```mermaid
 flowchart LR
     E["CodexErr"] --> P{"retry_policy()"}
@@ -233,6 +306,8 @@ flowchart LR
     DR -->|否| BK["backoff(n)=200ms*2^(n-1)*jitter(0.9~1.1)"]
 ```
 
+> ⭐ **重点**：`retry_policy()` 用**穷尽 `match`**（无 `_ =>` 兜底）实现——新增任何错误变体都会**编译失败**，逼迫作者显式声明"它可重试吗"。这从根本上杜绝了"默认重试"或"默认放弃"的隐式行为。
+
 值得注意的"反直觉"分类：
 
 - `UnexpectedStatus` 默认是可重试的 `Backoff`，但**若被识别为运行时认证拒绝**（`is_runtime_auth_denial(status, body, identity_error_code)`）则强制 `Never`——避免用 401 反复打服务端。
@@ -240,6 +315,10 @@ flowchart LR
 - `ContentFilter` 归为 `Backoff` 可重试，但重试前会先向对话注入模型特定的 `ContentFilterGuidance` 片段（见 §5），即"重试要改变输入，而不是原样重发"。
 
 ### 3.3 终止性采样结果：跨重试保留的"账"
+
+> **重要度**：⭐⭐⭐ 核心｜副作用已产生即不可重试
+
+⭐ **关键代码 6｜终止性结果判定**
 
 ```rust
 // core/src/responses_retry.rs
@@ -252,9 +331,12 @@ pub(crate) fn is_terminal_sampling_outcome(error: &CodexErr) -> bool {
 
 注释点明了原因："一次新的生成无法修复终止性的 provider 响应，也无法结算上一次尝试的账单"。因此这些结果在**传输重试、同回合 steering、压缩换模型**三条路径上都被一致地视为终止——防止"重试导致重复计费/绕过 hook 拒绝"。
 
-### 3.4 取消在错误模型中的位置
+> ⭐ **重点**：**副作用一旦产生即不可重试**。判断依据不是"错误码是否 5xx"，而是"这次尝试是否已经产生了无法回滚的后果（计费、预算扣减、hook 拒绝、部分输出）"。
 
+### 3.4 取消在错误模型中的位置
 **取消不是异常，但必须被建模为错误**——这是 Codex 处理 cancellation 的关键选择：
+
+⭐ **关键代码 3｜取消的统一原语**
 
 ```rust
 // async-utils/src/lib.rs
@@ -287,6 +369,10 @@ impl From<CancelErr> for CodexErr { /* → TurnAborted 类终止错误 */ }
 
 ### 3.5 三级错误恢复阶梯
 
+> **重要度**：⭐⭐⭐ 核心｜传输自愈→语义自愈→人工介入
+
+**图 4｜3.5 三级错误恢复阶梯** ⭐
+
 ```mermaid
 flowchart TD
     F["失败发生"] --> C{"可分类为瞬时?"}
@@ -310,10 +396,13 @@ flowchart TD
 ---
 
 ## 4. 传输层可靠性（HTTP / WebSocket / SSE）
-
 ### 4.1 三层重试栈
 
+> **重要度**：⭐⭐⭐ 核心｜预算分层、互不吞并
+
 Codex 的传输可靠性是**三层嵌套**的，各层职责严格不重叠：
+
+**图 5｜4.1 三层重试栈** ⭐
 
 ```mermaid
 flowchart TB
@@ -335,9 +424,14 @@ flowchart TB
     C --> C1 & C2 & C3
 ```
 
+> ⭐ **重点**：三层预算**互不吞并**（连接层不计数到请求层，请求层不计数到流层），且每层都用尽后返回**类型化的上限错误**（`TransportError::RetryLimit` / `ExhaustedResponseRetry`），而不是笼统的"失败"。
+
 第 2 层的关键代码（`codex-client/src/retry.rs`）：
 
+⭐ **关键代码 2｜请求级重试的唯一实现**
+
 ```rust
+// codex-client/src/retry.rs
 for attempt in 0..=policy.max_attempts {
     let req = make_req();                     // 每次重试重建请求（body 可重放）
     match op(req, attempt).await {
@@ -363,6 +457,7 @@ Err(TransportError::RetryLimit)               // 预算耗尽：显式的"重试
 - 预算耗尽返回专用 `TransportError::RetryLimit`，与"真实网络错误"在类型上区分，上层可以给出不同提示。
 
 ### 4.2 SSE 流：空闲超时 + "关闭即错误"
+⭐ **关键代码 7｜空闲超时与"提前关闭即错误"**
 
 ```rust
 // codex-client/src/sse.rs
@@ -379,7 +474,6 @@ loop {
 可靠性含义：**"连接还在但没有数据"被当作故障**（默认 300s 空闲超时），**"流正常结束但没收到 `response.completed`"也被当作故障**（`Stream` 错误 → 上层按可重试处理）。这消除了"UI 看起来在转圈但实际已死"的静默失败。
 
 ### 4.3 WebSocket → HTTP 传输降级
-
 `core/src/client.rs` 的 `ModelClientSession` 维护 WS 会话状态，遇到以下情况调用 `try_switch_fallback_transport()`（内部 `force_http_fallback` + 重置 `WebsocketSession::default()`）：
 
 - `WebsocketMessageTooLarge`（对端消息尺寸限制）→ `RetryPolicy::FallBackToHttp`
@@ -407,6 +501,8 @@ sess.send_event(..., EventMsg::Warning(WarningEvent {
 
 ### 4.5 传输层超时体系
 
+> **重要度**：⭐⭐ 重要
+
 **每一个等待都有上限**，而且超时值均为可配置 + 硬顶双保险：
 
 | 等待对象 | 默认值 | 配置项 | 硬顶/备注 |
@@ -423,7 +519,11 @@ sess.send_event(..., EventMsg::Warning(WarningEvent {
 
 ### 4.6 传输层幂等：重放安全的前提
 
+> **重要度**：⭐⭐⭐ 核心｜非幂等接口的重试边界
+
 `POST /responses` 本质上是**非幂等**的（会产生计费与生成）。Codex 的幂等策略不是"加请求 ID 去重"，而是三条更实际的约束：
+
+> ⭐ **重点**：对**非幂等**接口，正确做法不是发明幂等键，而是**只重试"确定未生效"的失败**（连接/构建/5xx），把"可能已生效"的失败（429、已计费）一律上抛给有语义的层处理。
 
 1. **只重试"确定未产生效果"的失败**：`RetryOn` 里 `retry_429: false`（429 意味着服务端已受理并计数，交上层按 `Retry-After` 处理）；`Build | Policy | ResponseTooLarge | RetryLimit` 永不重试。
 2. **每次重试重新构造请求**：`run_with_retry(policy, make_req, op)` 的 `make_req: FnMut() -> Request` 在**每一次** attempt 前重新调用，因此 body、签名、时间戳、一次性 header（如 `x-codex-ws-stream-request-start-ms`）总是新鲜的；不允许重用已消耗的请求对象。
@@ -433,9 +533,15 @@ sess.send_event(..., EventMsg::Warning(WarningEvent {
 
 ## 5. 回合级流重试：`handle_response_stream_error`
 
+> **重要度**：⭐⭐⭐ 核心｜全文信息密度最高的一章
+
 ### 5.1 状态机
 
+> **重要度**：⭐⭐⭐ 核心｜配合 §5.2 六条亮点阅读
+
 这是 Codex 可靠性最核心的一段状态机（`core/src/responses_retry.rs`），被 sampling 主循环（`session/turn.rs:2270`）与远程压缩 v2（`compact_remote_v2.rs:423`）共用。
+
+**图 6｜5.1 状态机** ⭐
 
 ```mermaid
 flowchart TD
@@ -466,6 +572,8 @@ flowchart TD
 
 ### 5.2 设计亮点逐条说明
 
+> **重要度**：⭐⭐⭐ 核心
+
 1. **两套独立预算**：普通流重试（`stream_max_retries`，默认 5）与"连接失败无限重试"（`UnboundedConnectionRetries` feature 门控，5s→60s 指数封顶）。后者针对**用户网络整体不可用**（笔记本合盖、切 Wi-Fi）场景——此时无限等待比报错终止体验好得多；但明确排除内部会话与 Bedrock（成本与语义不同）。
 2. **重试要让用户看见**：`notify_stream_error` 把"Reconnecting... 3/5"推到任何前端，注释直言目的是"让用户理解正在发生什么，而不是盯着看起来卡死的屏幕"。同时对 release 构建隐藏**第一次** WS 重连提示以减少噪音（debug 构建保留全部可见性以便诊断）——**可靠性与噪音控制的折中被显式编码**。
 3. **服务端 deadline 优先且不可绕过**：`retry_at = retry_after.map(deadline).unwrap_or(now + delay)`，并用**同一个时钟采样 `now`** 计算遥测 delay，保证埋点与实际等待一致。
@@ -473,7 +581,13 @@ flowchart TD
 5. **可取消**：调用处用 `.or_cancel(&preempt).or_cancel(&cancellation_token)` 包裹，等待期间用户 Ctrl-C / steering 能立刻打断，取消后返回 `TurnAborted` 而非继续重试。
 6. **终止错误在调用侧提前分流**（`session/turn.rs`）：`ContextWindowExceeded` → `set_total_tokens_full()` 后上抛（触发压缩路径）；`UsageLimitReached` → 先 `update_rate_limits()` 更新快照再上抛；`Fatal` / `is_terminal_sampling_outcome` → 直接上抛。
 
+> ⭐ **重点**：这一节（§5.1 状态机 + §5.2 六条亮点）是全文**信息密度最高**的部分：双预算分离、服务端 deadline 不可绕过、重试可见性、耗尽后带身份上抛——四条都可直接照搬到任何 agent harness。
+
 ### 5.3 取消（Cancellation）：令牌树与可抢占等待
+
+> **重要度**：⭐⭐⭐ 核心｜两段式中止 + 清理顺序敏感
+
+**图 7｜5.3 取消（Cancellation）：令牌树与可抢占等待** ⭐
 
 ```mermaid
 flowchart TD
@@ -501,7 +615,11 @@ flowchart TD
 
 ### 5.4 幂等（Idempotency）：重试不重跑已执行的副作用
 
+> **重要度**：⭐⭐⭐ 核心｜retry_cache 与"不确定即作废"
+
 流重试意味着**同一次采样可能被提交多次**。如果上一次尝试里模型已经调用了工具（写了文件、跑了命令），重试后重新提交相同历史会导致**重复执行**。Codex 的解法是在回合循环外持有一个跨尝试存活的证据缓存：
+
+⭐ **关键代码 4｜跨重试存活的幂等账本**
 
 ```rust
 // core/src/session/turn.rs（循环外声明，循环内复用）
@@ -520,13 +638,17 @@ loop {
 - **幂等校验严格到"宁可作废"**：当存在截断绑定（`Truncated` 参数）时，代码会逐一校验 `output_counts[call_id] == 1`（同一 call_id 只能有一个输出）、输入必须在输出之前且匹配（`code_mode_input_matches_output`）、重试快照与当前记录逐项比对（`cached.name == current.name && cached.arguments() == current.arguments()`）；任一不成立就把整个 cell 标为 `untrusted` 并 `invalidate_binding()/invalidate_output()`——**幂等证据不确定时宁可丢弃，也不带着可疑绑定重试**。
 - **新记录覆盖旧快照**：`retry_cache.retain(|key,_| !retained.result_metadata_updated)`——一旦有更新的结果元数据，旧的 retry 快照失效，避免用陈旧证据覆盖新事实。
 - **记录器不参与执行**：`executed_tool_calls.rs` 头注释强调"this recorder must never dispatch or await tools"，将幂等账本与执行路径解耦。
+
+> ⭐ **重点**：幂等证据"**不确定就作废**"（`untrusted_cells` → `invalidate_binding/invalidate_output`）。宁可让模型重跑一次工具，也不带着可疑绑定重试——这是幂等设计里最容易被忽略的保守性要求。
+
 - **调用身份统一**：`tool-call-id` crate 的 `ToolCallId`（区分 Responses 可见 ID 与 Code Mode 每-cell ID）与 `ResponseItemId` 构成幂等键的基础；`request_metadata` 只在 wire 层投影元数据，保留原始索引以便迟到的结果归位。
 
 ---
 
 ## 6. 上下文窗口可靠性：压缩、裁剪与模型回退
-
 上下文溢出是 LLM 代理最典型的"必然发生的故障"。Codex 用**多级递进**处理：
+
+**图 8｜6. 上下文窗口可靠性：压缩、裁剪与模型回退**
 
 ```mermaid
 flowchart TD
@@ -564,7 +686,11 @@ flowchart TD
 
 ### 6.1 检查点（Checkpoint）：压缩即固化点
 
+> **重要度**：⭐⭐ 重要
+
 压缩不只是"变小"，它同时是 Codex 的**上下文检查点机制**：`RolloutItem::Compacted(Box<CompactedItem>)` 将一整段可重放状态固化到持久化日志里。
+
+**图 9｜6.1 检查点（Checkpoint）：压缩即固化点** ⭐
 
 ```mermaid
 flowchart LR
@@ -604,7 +730,11 @@ flowchart LR
 
 ## 7. 执行可靠性：沙箱、审批与"降级重试"
 
+> **重要度**：⭐⭐⭐ 核心｜副作用最集中的一层
+
 ### 7.1 分层防护
+
+**图 10｜7.1 分层防护**
 
 ```mermaid
 flowchart LR
@@ -623,7 +753,6 @@ flowchart LR
 ```
 
 ### 7.2 `orchestrator.rs` 的"拒绝—提权—重试"决策
-
 `core/src/tools/orchestrator.rs` 用一条流程处理所有 exec 类工具，重试判定层层收紧：
 
 1. 仅当错误是 `CodexErrorDetails::Sandbox(SandboxErr::Denied { output, network_policy_decision })` 才进入重试通道；其他错误直接返回（并记录 `sandbox_outcome`）。
@@ -646,7 +775,11 @@ flowchart LR
 
 ### 7.4 人工介入（Human-in-the-loop）：审批是最后的可靠性手段
 
+> **重要度**：⭐⭐⭐ 核心｜fail-closed 三条铁律
+
 当机器无法安全裁定时，Codex 把失败**升级为带 id 的阻塞请求**，而不是自己猜。
+
+**图 11｜7.4 人工介入（Human-in-the-loop）：审批是最后的可靠性手段** ⭐
 
 ```mermaid
 flowchart TD
@@ -677,6 +810,9 @@ flowchart TD
 
 - **决策类型带作用域**：`Approved`（仅此次）/ `ApprovedForSession`（会话级缓存）/ `ApprovedExecpolicyAmendment`、`ApprovedMcpPolicyAmendment`、`NetworkPolicyAmendment`（**跨会话持久化的策略修正**）。人工介入不只是"放行一次"，而是**把人的裁定固化为机器下次能自动处理的规则**——这是降低未来失败率的根本手段。
 - **默认值是拒绝**：`impl Default for ReviewDecision { fn default() -> Self { Denied { rejection: "denied" } } }`；超时也是拒绝。**所有人工介入路径 fail-closed**。
+
+> ⭐ **重点**：人工介入的三条铁律——**① 默认拒绝（fail-closed）② 拒绝原因回给模型而非终止会话（`Denied` 是 `ToolError::Rejected`，只有 `Abort` 才终止）③ 人的裁定可固化为策略修正案（`ApprovedForSession` / `ApprovedExecpolicyAmendment` / `NetworkPolicyAmendment`），从而减少下一次介入**。
+
 - **人工介入本身可取消、可撤销**：`Op::CancelPatchApproval { id, turn_id }`、`Op::Interrupt`；`ApprovalResolution.cancellation_reason` 区分"用户拒绝"与"被取消"（`McpApprovalCancellationReason`）。
 - **审批来源可追溯**：`ApprovalResolutionSource::{User, Hook, Guardian}` 决定拒绝文案（"rejected by user" / "rejected by configuration" / "automatic approval review denied the action"），模型能据此选择不同补救策略。
 - **重试不重复弹询**：提权重试依赖审批缓存（`unified_exec` 注释："on sandbox denial, retries without sandbox when policy allows (**no re-prompt thanks to caching**)"）；但 Guardian 裁决的作用域**不**外溢到提权后的动作（§7.2）。
@@ -685,7 +821,11 @@ flowchart TD
 
 ### 7.5 超时与取消的进程级实现
 
+> **重要度**：⭐⭐⭐ 核心｜进程组 TERM→KILL 与管道排空超时
+
 命令执行的终止语义集中在 `core/src/exec.rs`，用 `tokio::select!` 把三个终止源合并：
+
+⭐ **关键代码 5｜超时与取消同源建模**
 
 ```rust
 pub enum ExecExpiration {                    // 为什么终止
@@ -702,6 +842,8 @@ const EXEC_TIMEOUT_EXIT_CODE: i32 = 124;     // 惯例 timeout 退出码
 const CANCELLATION_TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(50);
 pub const IO_DRAIN_TIMEOUT_MS: u64 = 2_000;  // 子进程被杀后管道可能被孙进程持有
 ```
+
+**图 12｜7.5 超时与取消的进程级实现** ⭐
 
 ```mermaid
 flowchart TD
@@ -728,11 +870,19 @@ flowchart TD
 
 ## 8. 状态持久化与崩溃恢复
 
+> **重要度**：⭐⭐⭐ 核心｜不丢不重的持久化契约
+
 ### 8.1 Rollout 写入器：写失败不丢数据
+
+> **重要度**：⭐⭐⭐ 核心｜"写成功才出队"
 
 `rollout/src/recorder.rs` 的 `RolloutWriterState` 注释就是可靠性契约：
 
 > "Items are first appended to `pending_items`; persist/flush/shutdown remove each item from that queue only after it is written successfully. I/O failures drop the file handle but keep the unwritten suffix so the next barrier can reopen the file and retry."
+
+> ⭐ **重点**：这一句注释就是整个持久层的可靠性契约——**"写成功才出队"** 同时保证了不丢（失败保留）与不重（整批重写），是幂等写入的最小充分实现。
+
+**图 13｜8.1 Rollout 写入器：写失败不丢数据** ⭐
 
 ```mermaid
 flowchart TD
@@ -763,6 +913,10 @@ flowchart TD
 
 ### 8.2 会话恢复路径
 
+> **重要度**：⭐⭐ 重要｜恢复宁缺勿错
+
+**图 14｜8.2 会话恢复路径** ⭐
+
 ```mermaid
 sequenceDiagram
     participant U as 用户 / daemon
@@ -789,7 +943,11 @@ sequenceDiagram
 
 ### 8.3 暂停与恢复（Pause / Resume）：worker 交接协议
 
+> **重要度**：⭐⭐⭐ 核心｜三条顺序约束
+
 Codex 支持把一个正在跑的根回合**暂停并关机**（例如 IDE/daemon 重启、云端 worker 漂移），由另一个 worker 用**同一个 turn_id** 恢复。这是整个仓库里对"顺序与幂等"要求最高的一段代码（`session/turn_suspension.rs` + `Op::SuspendTurnAndShutdown` / `Op::RecoverTurn`）。
+
+**图 15｜8.3 暂停与恢复（Pause / Resume）：worker 交接协议** ⭐
 
 ```mermaid
 sequenceDiagram
@@ -844,10 +1002,11 @@ sequenceDiagram
 | ⑨ 先停生产者再 flush+close | **检查点** | "Stop all producers before flushing their final history and closing its writer" |
 | 最后才发事件 | **幂等 / 并发** | 写完才能宣告，否则替代 worker 可能与当前 worker 并发写同一 thread（另有 `writer_lock` 跨进程保护） |
 
+> ⭐ **重点**：暂停/恢复的正确性来自三条顺序约束——**① flush 先于 cancel（持久化失败则不暂停）② 暂停不写终止事件（否则无法用原 ID 恢复）③ 宣告完成只在 writer 关闭之后（防并发写）**。任何一条颠倒都会造成数据丢失或双写。
+
 `SuspendTurnOutcome::{Suspended{turn_id}, NotActive, UnsupportedTask}` 三值返回使宿主能区分"已暂停"与"本来就没事可暂停"，避免宿主误以为需要恢复；恢复侧 `recover_turn_if_idle` 的头注释明确："Resumes an interrupted regular turn **only when the thread is idle**. Recovery starts no new user input and **preserves the turn ID** that was already recorded"；若未能提交则返回 `NotSubmitted { reason }` 而不是错误。
 
 ### 8.4 持久层的幂等与锁
-
 - **`persist()` 显式幂等**：文档注释 "This is idempotent. If materialization fails, the recorder keeps all pending items in memory and a later `persist()` or `flush()` can retry opening and writing the rollout file"。
 - **写入幂等靠"写成功才出队"**：`pending_items` 只在写成功后移除，因此重试不会产生重复行（失败那一批整体重写）。
 - **ordinal 幂等**：`stamp_item_ordinals` / `next_model_id_ordinals` 给历史项打全局序号，重放与截断（`thread_rollout_truncation`）均以此为准，避免 resume 后重复或错序。
@@ -857,8 +1016,9 @@ sequenceDiagram
 ---
 
 ## 9. 远程/分布式会话可靠性（exec-server、remote control、MCP）
-
 ### 9.1 exec-server：断连后按序号重放，不丢输出
+
+> **重要度**：⭐⭐⭐ 核心｜序号化幂等重放
 
 `exec-server/src/client_recovery.rs`（979 行，专责恢复）：
 
@@ -869,6 +1029,8 @@ const SESSION_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const REGISTRY_RECOVERY_INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const REGISTRY_RECOVERY_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 ```
+
+**图 16｜9.1 exec-server：断连后按序号重放，不丢输出** ⭐
 
 ```mermaid
 sequenceDiagram
@@ -897,9 +1059,15 @@ sequenceDiagram
 - **在途请求立即失败**：`fail_all_in_flight_work()` 避免调用方永久等待一个已经死掉的请求（快速失败优于静默挂起）。
 - **恢复窗口有硬上限**（50s，且预留 5s 给重放），注册表恢复用 500ms→5s 的独立退避。
 - **fail-closed 的安全默认**：恢复期间无法裁定的网络策略请求一律拒绝。
+
+> ⭐ **重点**：**事件序号化 + 幂等重放**（`last_published_seq` / `next_seq` / `closed_published`）是分布式会话恢复的通用解法；配套的 `fail_all_in_flight_work()` 体现另一条原则——**快失败优于静默挂起**。
+
 - **重连退避带"稳定性记忆"**（`remote/reconnect_backoff.rs`）：
 
+⭐ **关键代码 8｜带稳定性记忆的重连退避**
+
 ```rust
+// exec-server/src/remote/reconnect_backoff.rs
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 // 长于首个 keepalive 间隔 + pong 超时（30s + 60s）
@@ -924,7 +1092,6 @@ fn connection_closed(&mut self, connected_for: Duration) {
 - OAuth 侧有 `OAuthDiscoveryTimeout::{默认, Capped(max)}`，避免发现阶段无限等待。
 
 ### 9.3 Guardian 评审：共享 deadline 下的有限重试
-
 `ext/guardian-reviewer/src/retry.rs`：
 
 - `GuardianReviewSessionLimits { max_attempts, deadline }`，`assert!(max_attempts > 0)`；
@@ -934,6 +1101,8 @@ fn connection_closed(&mut self, connected_for: Duration) {
 - 头注释强调"Resubmissions are independent; this layer keeps no state between approval requests"——**重试层无状态**，避免跨请求的状态污染（与 §5 的 `ExhaustedResponseRetry.turn_id` 同理）。
 
 ### 9.4 远端会话上的八个关注点
+
+> **重要度**：⭐⭐ 重要
 
 | 关注点 | 远端层的具体做法 |
 |--------|------------------|
@@ -949,7 +1118,6 @@ fn connection_closed(&mut self, connected_for: Duration) {
 ---
 
 ## 10. 认证与配额可靠性
-
 | 机制 | 说明 | 代码 |
 |------|------|------|
 | **Token 刷新失败的语义化** | `RefreshTokenFailed(RefreshTokenFailedError/Reason)` → `RetryPolicy::Never`，直接提示重新登录，不做无意义重试；`oauth_session_login.rs` 注释："If saving fails, the next request can retry without asking the user to sign in again" | `login/`, `protocol/src/error.rs` |
@@ -969,6 +1137,7 @@ fn connection_closed(&mut self, connected_for: Duration) {
 ---
 
 ## 11. 可观测性：让重试可被度量
+⭐ **关键代码 9｜重试遥测宏**
 
 ```rust
 // codex-client/src/retry.rs
@@ -1008,7 +1177,6 @@ macro_rules! record_retry {
 ---
 
 ## 12. 测试策略：可靠性是被测出来的
-
 - 工作空间内约 **1750 个 `*_tests.rs`** 文件（与源码同目录、`#[path]` 挂载），**35 个 crate 依赖 `wiremock`** 做 HTTP 层故障注入。
 - 针对性可靠性测试举例：
   - `core/tests/suite/retry_after.rs`：用 wiremock 返回 429/5xx + `Retry-After`，断言首次重试延迟落在 **180–220ms**、第二次 **360–440ms**（即验证 `200ms × 2^(n-1)` 与 ±10% 抖动区间），并通过自定义 `tracing` Layer 捕获 `codex.retry` 事件验证遥测；还包含真实 `TcpSocket` 场景。
@@ -1034,21 +1202,20 @@ macro_rules! record_retry {
 ---
 
 ## 13. 关键常量与默认值速查
-
 | 常量 | 值 | 位置 | 含义 |
 |------|-----|------|------|
-| `INITIAL_DELAY_MS` / `BACKOFF_FACTOR` | 200ms / 2.0 | `async-utils/src/backoff.rs` | 全局退避基线，抖动 `0.9..1.1`；attempt 0 与 1 同延迟 |
+| ⭐ `INITIAL_DELAY_MS` / `BACKOFF_FACTOR` | 200ms / 2.0 | `async-utils/src/backoff.rs` | 全局退避基线，抖动 `0.9..1.1`；attempt 0 与 1 同延迟 |
 | `DEFAULT_REQUEST_MAX_RETRIES` | 4 | `model-provider-info/src/lib.rs` | 单请求 HTTP 重试次数（可配置） |
-| `DEFAULT_STREAM_MAX_RETRIES` | 5 | 同上 | 流/回合级重连次数（可配置） |
+| ⭐ `DEFAULT_STREAM_MAX_RETRIES` | 5 | 同上 | 流/回合级重连次数（可配置） |
 | `MAX_REQUEST_MAX_RETRIES` / `MAX_STREAM_MAX_RETRIES` | 100 / 100 | 同上 | 用户配置的硬上限（防误配置打死服务端） |
-| `DEFAULT_STREAM_IDLE_TIMEOUT_MS` | 300_000 (5min) | 同上 | SSE/WS 空闲超时 |
+| ⭐ `DEFAULT_STREAM_IDLE_TIMEOUT_MS` | 300_000 (5min) | 同上 | SSE/WS 空闲超时 |
 | `DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS` | 15_000 | 同上 | WS 建连超时 |
 | `DEFAULT_CREDENTIAL_EXPORT_TIMEOUT_MS` | 30_000 | 同上 | 凭证导出超时 |
 | `DEFAULT_AWS_AUTH_REFRESH_TIMEOUT_MS` | 300_000 | 同上 | AWS 凭证刷新超时 |
 | `INITIAL_/MAX_CONNECTION_RETRY_DELAY` | 5s / 60s | `core/src/responses_retry.rs` | 无限连接重试通道 |
 | `ERROR_MESSAGE_UI_MAX_BYTES` | 2KB | `protocol/src/error.rs` | UI 错误消息上限 |
-| `INITIAL_/MAX_BACKOFF`, `STABLE_CONNECTION_DURATION` | 1s / 30s / 120s | `exec-server/src/remote/reconnect_backoff.rs` | executor 重连退避与稳定判定 |
-| `SESSION_RECOVERY_TIMEOUT` / `SESSION_REPLAY_RESERVE` | 50s / 5s | `exec-server/src/client_recovery.rs` | 会话恢复窗口与重放预留 |
+| ⭐ `INITIAL_/MAX_BACKOFF`, `STABLE_CONNECTION_DURATION` | 1s / 30s / 120s | `exec-server/src/remote/reconnect_backoff.rs` | executor 重连退避与稳定判定 |
+| ⭐ `SESSION_RECOVERY_TIMEOUT` / `SESSION_REPLAY_RESERVE` | 50s / 5s | `exec-server/src/client_recovery.rs` | 会话恢复窗口与重放预留 |
 | `SESSION_RECOVERY_RETRY_INTERVAL` | 100ms | 同上 | 恢复轮询间隔 |
 | `REGISTRY_RECOVERY_*_INTERVAL` | 500ms → 5s | 同上 | 注册表恢复退避 |
 | `STREAMABLE_HTTP_RETRY_DELAYS_MS` | `[250, 1000]` | `rmcp-client/src/streamable_http_retry.rs` | MCP initialize 重试 |
@@ -1057,13 +1224,15 @@ macro_rules! record_retry {
 
 ### 13.1 超时（Timeout）常量全谱
 
+> **重要度**：⭐⭐ 重要｜速查
+
 | 常量 | 值 | 位置 | 超时后的行为 |
 |------|-----|------|--------------|
-| `DEFAULT_EXEC_COMMAND_TIMEOUT_MS` | 10s | `core/src/exec.rs:67` | 杀进程组，合成退出码 `128+64`，`SandboxErr::Timeout{output}` |
+| ⭐ `DEFAULT_EXEC_COMMAND_TIMEOUT_MS` | 10s | `core/src/exec.rs:67` | 杀进程组，合成退出码 `128+64`，`SandboxErr::Timeout{output}` |
 | `EXEC_TIMEOUT_EXIT_CODE` | 124 | 同上 | 惯例 timeout 退出码（外部工具） |
-| `CANCELLATION_TERMINATION_GRACE_PERIOD` | 50ms | 同上 | TERM 宽限期，过期则 KILL 进程组 |
-| `IO_DRAIN_TIMEOUT_MS` | 2s | `core/src/exec.rs:98` | `abort()` 读取任务，防止 agent 整体挂死 |
-| `GRACEFULL_INTERRUPTION_TIMEOUT_MS` | 100ms | `core/src/tasks/mod.rs:87` | 任务未优雅结束 → `handle.abort()` + `ForcedTeardown` |
+| ⭐ `CANCELLATION_TERMINATION_GRACE_PERIOD` | 50ms | 同上 | TERM 宽限期，过期则 KILL 进程组 |
+| ⭐ `IO_DRAIN_TIMEOUT_MS` | 2s | `core/src/exec.rs:98` | `abort()` 读取任务，防止 agent 整体挂死 |
+| ⭐ `GRACEFULL_INTERRUPTION_TIMEOUT_MS` | 100ms | `core/src/tasks/mod.rs:87` | 任务未优雅结束 → `handle.abort()` + `ForcedTeardown` |
 | `USER_SHELL_TIMEOUT_MS` | 1h | `core/src/tasks/user_shell.rs:47` | `!cmd` 用户命令上限 |
 | `DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS` | 300s | `core/src/unified_exec/mod.rs:73` | 后台终端上限（`Op::CleanBackgroundTerminals` 可手动清） |
 | `DEFAULT_MULTI_AGENT_V2_{MIN,DEFAULT,MAX}_WAIT_TIMEOUT_MS` | 10s / 30s / 1h | `core/src/config/mod.rs:281-287` | `wait_agent` 工具超时（返回 timeout summary 而非错误） |
@@ -1096,21 +1265,23 @@ macro_rules! record_retry {
 
 ### 13.2 取消（Cancellation）与幂等（Idempotency）关键点
 
+> **重要度**：⭐⭐ 重要｜速查
+
 | 主题 | 机制 | 位置 |
 |------|------|------|
-| 取消原语 | `CancellationToken` 树 + `OrCancelExt::or_cancel()`（`tokio::select!`） | `async-utils/src/lib.rs` |
+| ⭐ 取消原语 | `CancellationToken` 树 + `OrCancelExt::or_cancel()`（`tokio::select!`） | `async-utils/src/lib.rs` |
 | 取消结果类型 | `CancelErr::Cancelled` → `CodexErr`（`Never` 重试） | `protocol/src/error.rs:332,376` |
 | 中止原因分类 | `TurnAbortReason::{Interrupted, Replaced, ReviewEnded, BudgetLimited}` | `protocol/src/protocol.rs:4764` |
-| 两段式中止 | `cancel()` → 100ms 宽限 → `handle.abort()` | `core/src/tasks/mod.rs:1225`、`turn_suspension.rs` |
-| 清理顺序 | 先让任务观测取消，再 `input_queue.clear_pending()` | `core/src/tasks/mod.rs:717,771` |
+| ⭐ 两段式中止 | `cancel()` → 100ms 宽限 → `handle.abort()` | `core/src/tasks/mod.rs:1225`、`turn_suspension.rs` |
+| ⭐ 清理顺序 | 先让任务观测取消，再 `input_queue.clear_pending()` | `core/src/tasks/mod.rs:717,771` |
 | 部分取消 | `SamplingInterrupt{tools, finished}`：取消工具但保留已采样项/摘要 | `core/src/session/sampling_interrupt.rs` |
 | 抢占式取消 | `preempt` 令牌 → mailbox steering，返回 `needs_follow_up=true` | `core/src/session/turn.rs` |
 | 进程级取消 | `ExecExpiration::{Cancellation, TimeoutOrCancellation}` + 进程组 TERM→KILL | `core/src/exec.rs:133-176` |
 | 远端取消 | `fail_all_in_flight_work()`、`NetworkRequestCancellation{Reason}` | `exec-server/src/client_recovery.rs` |
 | 幂等：请求 | `make_req: FnMut() -> Request` 每次重建；`retry_429=false` | `codex-client/src/retry.rs` |
-| 幂等：工具证据 | `ExecutedToolCallCache`（retry_cache）+ 冲突则 `invalidate_binding/output` | `core/src/tools/executed_tool_calls*` |
-| 幂等：事件重放 | `last_published_seq` / `next_seq` / `closed_published` 去重 | `exec-server/src/client_recovery.rs` |
-| 幂等：写入 | `persist()` 幂等 + "写成功才出队" + writer lock | `rollout/src/{recorder,writer_lock}.rs` |
+| ⭐ 幂等：工具证据 | `ExecutedToolCallCache`（retry_cache）+ 冲突则 `invalidate_binding/output` | `core/src/tools/executed_tool_calls*` |
+| ⭐ 幂等：事件重放 | `last_published_seq` / `next_seq` / `closed_published` 去重 | `exec-server/src/client_recovery.rs` |
+| ⭐ 幂等：写入 | `persist()` 幂等 + "写成功才出队" + writer lock | `rollout/src/{recorder,writer_lock}.rs` |
 | 幂等：审批 | `ApprovalCacheKey::{ExecCommand, ApplyPatch}`；`ApprovedForSession` 会话级缓存 | `core/src/tools/approvals.rs:171` |
 | 幂等：身份 | `ToolCallId`、`ResponseItemId`、`turn_id`、`thread_id`、`ordinal` | `tool-call-id/`、`rollout/src/ordinal.rs` |
 
@@ -1118,37 +1289,45 @@ macro_rules! record_retry {
 
 ## 14. 设计原则总结与可借鉴点
 
+> **重要度**：⭐⭐⭐ 核心｜可直接移植的结论
+
 ### 14.1 Codex 可靠性设计的十四条原则
 
-1. **失败语义集中化**：所有"能不能重试、等多久"收敛到 `CodexErr::retry_policy()` / `retry_delay()`。任何新错误变体都必须显式归类（`match` 穷尽 + 编译期保证），杜绝"默认重试"或"默认放弃"的隐式行为。
+> **重要度**：⭐⭐⭐ 核心
+
+1. ⭐ **失败语义集中化**：所有"能不能重试、等多久"收敛到 `CodexErr::retry_policy()` / `retry_delay()`。任何新错误变体都必须显式归类（`match` 穷尽 + 编译期保证），杜绝"默认重试"或"默认放弃"的隐式行为。
 2. **重试分层、预算分离**：连接层（route-aware pool / TLS fallback）、请求层（`run_with_retry`，4 次）、流层（`ResponsesStreamRetryState`，5 次）、连接失败无限通道（feature 门控）、评审层（Guardian `max_attempts` + deadline）各有独立预算，互不吞并；换传输时**只重置流层预算**且仍尊重服务端 deadline。
-3. **服务端建议至上**：`Retry-After` 以绝对 `Instant` 贯穿全链路，过期归零而非回退本地延迟，透传时不重新计时。
+3. ⭐ **服务端建议至上**：`Retry-After` 以绝对 `Instant` 贯穿全链路，过期归零而非回退本地延迟，透传时不重新计时。
 4. **降级必须可见**：WS→HTTP 发 `Warning` 事件，重连发 `Reconnecting... n/m`，提权重试走审批并记录 `sandbox_outcome`。用户永远知道系统在自救。
-5. **终止性错误不可被重试绕过**：计费、预算、hook 拒绝、策略违规、内容策略等一次定型，跨"传输重试 / steering / 换模型压缩"一致保留。
+5. ⭐ **终止性错误不可被重试绕过**：计费、预算、hook 拒绝、策略违规、内容策略等一次定型，跨"传输重试 / steering / 换模型压缩"一致保留。
 6. **重试要改变输入**：内容过滤 → 注入 guidance；上下文溢出 → 从头裁剪并重置预算；压缩失败 → 换模型。原样重发只用于纯瞬时故障。
-7. **持久化以"不丢"为第一目标**：内存 pending 队列 + 写成功才移除 + 失败重开句柄重试 + fsync（含目录项）+ 跨进程写锁 + `terminal_failure()` 优先暴露根因。
-8. **恢复宁缺勿错**：daemon 中断回合恢复设多重前置条件；exec-server 恢复期网络策略 fail-closed；协议顺序错乱视为致命错误。**正确性 > 恢复率**。
+7. ⭐ **持久化以"不丢"为第一目标**：内存 pending 队列 + 写成功才移除 + 失败重开句柄重试 + fsync（含目录项）+ 跨进程写锁 + `terminal_failure()` 优先暴露根因。
+8. ⭐ **恢复宁缺勿错**：daemon 中断回合恢复设多重前置条件；exec-server 恢复期网络策略 fail-closed；协议顺序错乱视为致命错误。**正确性 > 恢复率**。
 9. **可靠性可度量、可测试**：`record_retry!` 分层埋点、双段耗时（initial/escalated）、退避区间被测试精确断言、故障路径常量在测试构建中降级以便 CI 真实走到。
-10. **一切等待均可取消且有上限**：`or_cancel()` 包裹所有阻塞点；`ExecExpiration` 把"超时"与"取消"建模为同一枚举的两个变体；取消后还有宽限期（50ms/100ms）再强制终止。**没有不可取消的阻塞点，也没有无上限的等待**。
+10. ⭐ **一切等待均可取消且有上限**：`or_cancel()` 包裹所有阻塞点；`ExecExpiration` 把"超时"与"取消"建模为同一枚举的两个变体；取消后还有宽限期（50ms/100ms）再强制终止。**没有不可取消的阻塞点，也没有无上限的等待**。
 11. **取消也要有序清理**：先 `cancel()` → 给任务时间观测取消 → 再 `clear_pending()` → 超时才 `abort()`。顺序错了就会把"用户取消"误写为"用户拒绝"，污染不可逆的历史。
-12. **重试必须幂等**：请求每次重建（`make_req`）；已执行工具的证据用 `retry_cache` 重放而非重跑；事件用序号去重；写入"成功才出队"；审批结果可缓存。幂等证据不确定时**宁可作废**。
-13. **检查点先于不可逆操作**：暂停前先 flush（flush 失败则不暂停）；压缩同时固化 `replacement_history`/`guardian_history`/`retained_context`；宣告完成只在 writer 关闭之后。检查点是幂等恢复的前提。
-14. **人工介入是正式的恢复层级**：审批不是 UX 附加物，而是恢复阶梯的第三级（§3.5）：带 id、可取消、可撤销、有超时（超时=拒绝）、默认拒绝（fail-closed），并且人的裁定可以固化为策略修正案，从而**减少下一次的人工介入**。
+12. ⭐ **重试必须幂等**：请求每次重建（`make_req`）；已执行工具的证据用 `retry_cache` 重放而非重跑；事件用序号去重；写入"成功才出队"；审批结果可缓存。幂等证据不确定时**宁可作废**。
+13. ⭐ **检查点先于不可逆操作**：暂停前先 flush（flush 失败则不暂停）；压缩同时固化 `replacement_history`/`guardian_history`/`retained_context`；宣告完成只在 writer 关闭之后。检查点是幂等恢复的前提。
+14. ⭐ **人工介入是正式的恢复层级**：审批不是 UX 附加物，而是恢复阶梯的第三级（§3.5）：带 id、可取消、可撤销、有超时（超时=拒绝）、默认拒绝（fail-closed），并且人的裁定可以固化为策略修正案，从而**减少下一次的人工介入**。
 
 ### 14.2 八个关注点的落地准则速查
 
+> **重要度**：⭐⭐⭐ 核心
+
 | 关注点 | Codex 的准则（可直接移植） |
 |--------|--------------------------|
-| 错误恢复 | 三级阶梯：传输自愈 → 语义自愈 → 人工介入；每级入口前先问"这个错误分类上可恢复吗" |
+| 错误恢复 ⭐ | 三级阶梯：传输自愈 → 语义自愈 → 人工介入；每级入口前先问"这个错误分类上可恢复吗" |
 | 超时 | 每个等待配一个常量（可配 + 硬顶）；辅助能力短超时且降级；超时结果是枚举而非异常 |
-| 取消 | 令牌树 + `or_cancel`；两段式（宽限→强制）；清理有顺序；取消 ≠ 丢弃已得成果 |
-| 重试 | 分层预算 + 退避抖动 + 服务端 deadline 优先 + 重试要改变输入 + 耗尽后带身份上抛 |
-| 幂等 | 幂等键（call_id/seq/ordinal/turn_id）+ 写成功才出队 + 重放而非重执行 + 不确定则作废 |
+| 取消 ⭐ | 令牌树 + `or_cancel`；两段式（宽限→强制）；清理有顺序；取消 ≠ 丢弃已得成果 |
+| 重试 ⭐ | 分层预算 + 退避抖动 + 服务端 deadline 优先 + 重试要改变输入 + 耗尽后带身份上抛 |
+| 幂等 ⭐ | 幂等键（call_id/seq/ordinal/turn_id）+ 写成功才出队 + 重放而非重执行 + 不确定则作废 |
 | 检查点 | 不可逆操作前先固化；检查点带兼容/降级规则；"仅内存"的检查点不得声称已持久 |
-| 暂停/恢复 | flush 失败则不暂停；暂停不写终止事件；恢复沿用原 ID 且仅 idle 时；最后才宣告完成 |
-| 人工介入 | 带 id 阻塞请求 + fail-closed 默认 + 可缓存/可修政策/可撤销 + 拒绝原因回给模型而非终止 |
+| 暂停/恢复 ⭐ | flush 失败则不暂停；暂停不写终止事件；恢复沿用原 ID 且仅 idle 时；最后才宣告完成 |
+| 人工介入 ⭐ | 带 id 阻塞请求 + fail-closed 默认 + 可缓存/可修政策/可撤销 + 拒绝原因回给模型而非终止 |
 
 ### 14.3 对其他 harness 的可借鉴清单
+
+> **重要度**：⭐⭐⭐ 核心｜六份 checklist
 
 - 定义一个**带负载 + 可派生无负载 kind** 的统一错误类型，把重试策略作为错误类型的方法而非调用方的 `if`。
 - 把 `Retry-After` 建模为**绝对 deadline 类型**，全链路透传，禁止各处 `now + delay` 重新计时。
@@ -1168,7 +1347,6 @@ macro_rules! record_retry {
 ---
 
 ## 15. 八大关注点 × 层级 交叉矩阵
-
 下表把八个关注点在六个层级上的具体落点一次性展开，可作为审阅/移植时的 checklist（✅ = 有专门实现，• = 复用上层机制，— = 不适用）：
 
 | 层级 \ 关注点 | 错误恢复 | 超时 | 取消 | 重试 | 幂等 | 检查点 | 暂停/恢复 | 人工介入 |
@@ -1183,7 +1361,11 @@ macro_rules! record_retry {
 
 ### 15.1 一个端到端例子：八个关注点如何协同
 
+> **重要度**：⭐⭐ 重要｜八机制协同示例
+
 以"模型调用 `shell` 跑一个需要联网的测试命令，中途用户合上笔记本"为例：
+
+**图 17｜15.1 一个端到端例子：八个关注点如何协同** ⭐
 
 ```mermaid
 sequenceDiagram
@@ -1223,7 +1405,6 @@ sequenceDiagram
 ---
 
 ## 附：可靠性相关文件索引
-
 | 主题 | 路径 |
 |------|------|
 | 错误模型与重试策略 | `protocol/src/error.rs`、`protocol/src/agent_error.rs` |
