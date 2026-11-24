@@ -35,6 +35,8 @@
 6. [设计取舍与工程约束](#6-设计取舍与工程约束)
 7. [附录：常量与文件索引](#7-附录常量与文件索引)
 
+> 接入实践已拆为独立文档：[company-api-integration.md](./company-api-integration.md)
+
 ---
 
 ## 1. 总览：Tool 与 MCP 的分层关系
@@ -507,7 +509,60 @@ sequenceDiagram
     S-->>M: function_call_output
 ```
 
-一个常见的误解是「orchestrator 位于 registry 与 handler 之间」。实际上 **`ToolOrchestrator` 是 handler 内部自己创建的**（`apply_patch.rs:606`、`unified_exec/process_manager.rs:1508`），只有需要沙箱的工具才用它。MCP handler 根本不经过 orchestrator，它走 `mcp_tool_call` 的独立审批链（见 4.7/4.8）。
+这张图用时序图而非流程图，因为要表达的核心是**调用顺序**与**返回路径**，而不是分支决策。它固定了 7 个参与者：
+
+| 参与者 | 角色 | 关键位置 |
+|--------|------|----------|
+| `模型` | 发起 `function_call` | Responses API |
+| `stream_events_utils` | 把流式事件转成内部 `ToolCall` | `handle_output_item_done:360` |
+| `parallel` | 并发准入与结果汇总 | `ToolCallRuntime:55`、`handle_tool_call:148` |
+| `ToolRouter` | 按工具名路由到 registry | `dispatch_tool_call_with_state:388` |
+| `ToolRegistry` | 持有 `RegisteredTool`，跑 pre-tool hooks | `dispatch_any_with_state:794`、`handle_any_tool:1186` |
+| `Handler` | 具体工具实现 | `runtime.handle(invocation)` |
+| `ToolOrchestrator` | 审批 + 沙箱编排（仅沙箱类工具） | `orchestrator.rs:43` |
+
+19 个编号步骤按职责分为六个阶段：
+
+| 阶段 | 步骤 | 做了什么 |
+|------|------|----------|
+| **A. 事件解析** | 1–3 | 模型返回 `output_item.done`（携带 `function_call`）→ `handle_output_item_done` → `build_tool_call`（`router.rs:285`）把它转成内部 `ToolCall` |
+| **B. 并发准入** | 4–5 | `handle_tool_call` 取出 `ToolCallRuntime`——并发许可 + 取消令牌在这里获得，**这是全链路唯一的并发管控点** |
+| **C. 路由与查表** | 6–9 | `dispatch_tool_call_with_state` → `dispatch_any_with_state` → 查表定位 `RegisteredTool` → `handle_any_tool` |
+| **D. 前置钩子** | 10 | `apply_pre_tool_use`，见下方 Note |
+| **E. 执行** | 11–13 | `runtime.handle(invocation)` 进入 handler；沙箱类 handler 自己 `ToolOrchestrator::new()` 并 `run`，完成审批 + 沙箱选择 + 提权重试 |
+| **F. 回传** | 14–19 | `Out` → `Box` 包裹的 `ToolOutput` → `AnyToolResult`（`registry.rs:328`）→ 单工具结果 → 汇总 → `function_call_output` |
+
+按阶段看，链路是一条几乎线性的管道，只有 D 与 E 两处可能提前退出：
+
+```mermaid
+flowchart TB
+    A["A. 事件解析<br/>output_item.done → build_tool_call"] --> B["B. 并发准入<br/>parallel + ToolCallRuntime"]
+    B --> C["C. 路由与查表<br/>router → registry → RegisteredTool"]
+    C --> D["D. 前置钩子<br/>apply_pre_tool_use"]
+    D --> E["E. 执行<br/>handler.handle，沙箱类再进 Orchestrator"]
+    E --> F["F. 逐层包装回传<br/>ToolOutput → AnyToolResult → function_call_output"]
+    D -->|hook 拒绝| X["直接返回错误"]
+    E -->|取消令牌触发| Y["AbortedToolOutput"]
+```
+
+图上的两个 `Note` 是这张图最重要的两条断言：
+
+1. **`Note over G: pre-tool hooks 可改写/拒绝`** —— hook 位于**查表之后、执行之前**。因此它能改写参数、也能直接拒绝，但无法改变「调用哪个工具」：工具选择在阶段 C 就已经确定了。
+2. **`Note over H: 沙箱类 handler 自行创建 ToolOrchestrator`** —— orchestrator **不在** registry 与 handler 之间，而在 handler 内部（`apply_patch.rs:606`、`unified_exec/process_manager.rs:1508`）。这直接解释了为什么 MCP handler 不经过它，而走 `mcp_tool_call` 的独立审批链（见 4.7/4.8）。
+
+线型区分了方向语义：
+
+- **实线 `->>`**：调用/下发，逐层深入直到 handler。
+- **虚线 `-->>`**：返回，沿原栈**逐层包装**。
+
+返回路径不是简单透传，每层都加自己的语义：handler 返回 `ToolOutput` trait object → registry 包成 `AnyToolResult`（带工具身份与结果类型）→ parallel 汇总多个结果 → stream 层转成模型可消费的 `function_call_output`。
+
+这张图刻意省略了四条分支（分别在别处覆盖）：
+
+- **多工具并行**：同一轮的多个 `function_call` 会在 `parallel` 层并发展开，图上只画一条。
+- **Code Mode 分支**：嵌套调用走 `handle_tool_call_with_source` 与 `dispatch_tool_call_with_code_mode_result_inner`，并发记账语义与顶层不同。
+- **MCP 分支**：`McpHandler` 不经过 `ToolOrchestrator`。
+- **错误与取消**：`FunctionCallError` 沿同一路径回传；`CancellationToken` 触发时返回 `AbortedToolOutput`（`context.rs`），这两个出口在图上没有画出。
 
 并发模型要点：
 
@@ -1095,6 +1150,8 @@ flowchart TB
 - tracing span（跨层传递 `McpRuntimeContext`）。
 
 缺口在于：**没有统一的「工具调用决策追踪」**——即「为什么这个工具对模型不可见」（是 feature flag？exposure policy？还是 catalog 未就绪？）需要人工逐层排查。这是 `apply_mcp_tool_exposure_policy` 缺少诊断输出的直接后果。
+
+---
 
 ---
 
